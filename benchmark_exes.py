@@ -120,6 +120,15 @@ class BenchmarkContext:
     runs_per_exe: int
 
 
+@dataclass
+class LaunchDiscoveryContext:
+    target_name: str
+    launch_epoch: float
+    discovery_deadline_epoch: float
+    baseline_pids: Set[int]
+    preferred_paths: Set[str]
+
+
 # ============================================================
 # HELPERS
 # ============================================================
@@ -138,6 +147,90 @@ def safe_min(values: List[float]) -> float:
 
 def safe_max(values: List[float]) -> float:
     return max(values) if values else 0.0
+
+
+def normalize_exe_path(path: Optional[str]) -> Optional[str]:
+    if not path:
+        return None
+
+    try:
+        return os.path.normcase(os.path.abspath(path))
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def snapshot_matching_processes(exe_path: str) -> Tuple[str, Set[int], Set[str]]:
+    target_name = os.path.basename(exe_path).lower()
+    normalized_target = normalize_exe_path(exe_path)
+    baseline_pids: Set[int] = set()
+    preferred_paths: Set[str] = set()
+
+    if normalized_target:
+        preferred_paths.add(normalized_target)
+
+    for proc in psutil.process_iter(["pid", "name", "exe"]):
+        try:
+            proc_name = (proc.info.get("name") or "").lower()
+            proc_exe = normalize_exe_path(proc.info.get("exe"))
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+
+        if proc_name == target_name or (normalized_target and proc_exe == normalized_target):
+            baseline_pids.add(proc.pid)
+            if proc_exe:
+                preferred_paths.add(proc_exe)
+
+    return target_name, baseline_pids, preferred_paths
+
+
+def discover_related_processes(
+    discovery_context: Optional[LaunchDiscoveryContext],
+    tracked_pids: Optional[Set[int]] = None,
+) -> List[psutil.Process]:
+    if discovery_context is None or time.time() > discovery_context.discovery_deadline_epoch:
+        return []
+
+    known_pids = tracked_pids or set()
+    candidates: List[Tuple[float, int, psutil.Process]] = []
+
+    for proc in psutil.process_iter(["pid", "name", "exe", "create_time"]):
+        try:
+            pid = proc.pid
+            if pid in known_pids or pid in discovery_context.baseline_pids:
+                continue
+
+            create_time = float(proc.info.get("create_time") or 0.0)
+            if create_time and create_time < discovery_context.launch_epoch - 1.0:
+                continue
+
+            proc_name = (proc.info.get("name") or "").lower()
+            proc_exe = normalize_exe_path(proc.info.get("exe"))
+            exact_path_match = bool(proc_exe and proc_exe in discovery_context.preferred_paths)
+            name_match = proc_name == discovery_context.target_name
+            if not exact_path_match and not name_match:
+                continue
+
+            if proc_exe:
+                discovery_context.preferred_paths.add(proc_exe)
+
+            candidates.append((create_time, pid, proc))
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, ValueError):
+            continue
+
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return [proc for _, _, proc in candidates]
+
+
+def get_tracked_processes(
+    root_proc: psutil.Process,
+    tracked_pids: Optional[Set[int]] = None,
+    discovery_context: Optional[LaunchDiscoveryContext] = None,
+) -> List[psutil.Process]:
+    if tracked_pids is not None:
+        discovered = discover_related_processes(discovery_context, tracked_pids)
+        tracked_pids.update(p.pid for p in discovered)
+
+    return get_process_tree(root_proc, tracked_pids)
 
 
 class VS_FIXEDFILEINFO(ctypes.Structure):
@@ -379,12 +472,13 @@ def sample_tree_usage(
     primed: set,
     io_tracker: Dict[int, Tuple[int, int, int, int]],
     tracked_pids: Set[int],
+    discovery_context: Optional[LaunchDiscoveryContext] = None,
 ) -> ProcessSnapshot:
     """
     Returns current CPU/memory plus I/O deltas since the previous sample
     for the root process and all children.
     """
-    procs = get_process_tree(root_proc, tracked_pids)
+    procs = get_tracked_processes(root_proc, tracked_pids, discovery_context)
     prime_cpu_counters(procs, primed)
 
     total_cpu = 0.0
@@ -435,6 +529,7 @@ def sample_tree_usage(
 def terminate_process_tree(
     root_proc: psutil.Process,
     tracked_pids: Optional[Set[int]] = None,
+    discovery_context: Optional[LaunchDiscoveryContext] = None,
     timeout: float = 5.0,
 ) -> TerminationResult:
     """
@@ -444,7 +539,7 @@ def terminate_process_tree(
     force_killed_processes = 0
 
     try:
-        procs = get_process_tree(root_proc, tracked_pids)
+        procs = get_tracked_processes(root_proc, tracked_pids, discovery_context)
         for p in reversed(procs):
             try:
                 p.terminate()
@@ -478,24 +573,42 @@ def terminate_process_tree(
     )
 
 
-def wait_for_process_start(popen_obj: subprocess.Popen, timeout: float = 10.0) -> Tuple[psutil.Process, float]:
+def wait_for_process_start(
+    popen_obj: subprocess.Popen,
+    discovery_context: Optional[LaunchDiscoveryContext] = None,
+    timeout: float = 10.0,
+) -> Tuple[psutil.Process, float]:
     """
-    Wait until the process is observable via psutil.
+    Wait until the process is observable via psutil, or adopt a same-app
+    handoff process created during startup for single-instance apps.
     """
     start = time.perf_counter()
     deadline = start + timeout
 
     while time.perf_counter() < deadline:
-        if popen_obj.poll() is not None:
-            raise RuntimeError(f"Process exited immediately with code {popen_obj.returncode}")
+        if popen_obj.poll() is None:
+            try:
+                proc = psutil.Process(popen_obj.pid)
+                _ = proc.status()
+                launch_time = time.perf_counter() - start
+                return proc, launch_time
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
 
-        try:
-            proc = psutil.Process(popen_obj.pid)
-            _ = proc.status()
+        adopted = discover_related_processes(discovery_context, {popen_obj.pid})
+        if adopted:
             launch_time = time.perf_counter() - start
-            return proc, launch_time
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            time.sleep(0.01)
+            return adopted[0], launch_time
+
+        time.sleep(0.01)
+
+    adopted = discover_related_processes(discovery_context, {popen_obj.pid})
+    if adopted:
+        launch_time = time.perf_counter() - start
+        return adopted[0], launch_time
+
+    if popen_obj.poll() is not None:
+        raise RuntimeError(f"Process exited immediately with code {popen_obj.returncode}")
 
     raise TimeoutError("Timed out waiting for process to become observable")
 
@@ -558,6 +671,15 @@ def benchmark_exe_once(
         raise FileNotFoundError(f"EXE not found: {exe_path}")
 
     command = [exe_path] + args
+    target_name, baseline_pids, preferred_paths = snapshot_matching_processes(exe_path)
+    launch_epoch = time.time()
+    discovery_context = LaunchDiscoveryContext(
+        target_name=target_name,
+        launch_epoch=launch_epoch,
+        discovery_deadline_epoch=launch_epoch + max(3.0, startup_window),
+        baseline_pids=baseline_pids,
+        preferred_paths=preferred_paths,
+    )
 
     popen = subprocess.Popen(
         command,
@@ -566,16 +688,26 @@ def benchmark_exe_once(
         stderr=subprocess.DEVNULL
     )
 
-    proc, launch_time = wait_for_process_start(popen)
+    proc, launch_time = wait_for_process_start(popen, discovery_context=discovery_context)
     primed = set()
     io_tracker: Dict[int, Tuple[int, int, int, int]] = {}
     tracked_pids: Set[int] = {proc.pid}
+
+    if popen.pid != proc.pid:
+        tracked_pids.add(popen.pid)
+
+    try:
+        proc_exe = normalize_exe_path(proc.exe())
+        if proc_exe:
+            discovery_context.preferred_paths.add(proc_exe)
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        pass
 
     # Apply requested process priority after the process becomes observable
     apply_process_priority(proc, priority)
 
     # Prime CPU counters once before timed sampling begins
-    initial_tree = get_process_tree(proc, tracked_pids)
+    initial_tree = get_tracked_processes(proc, tracked_pids, discovery_context)
     tracked_pids.update(p.pid for p in initial_tree)
     prime_cpu_counters(initial_tree, primed)
     time.sleep(sample_interval)
@@ -613,7 +745,7 @@ def benchmark_exe_once(
         if elapsed >= total_window:
             break
 
-        snapshot = sample_tree_usage(proc, primed, io_tracker, tracked_pids)
+        snapshot = sample_tree_usage(proc, primed, io_tracker, tracked_pids, discovery_context)
         if snapshot.process_count == 0:
             exited_early = True
             exit_code = popen.returncode
@@ -643,8 +775,8 @@ def benchmark_exe_once(
 
         time.sleep(sample_interval)
 
-    if auto_terminate and get_process_tree(proc, tracked_pids):
-        termination = terminate_process_tree(proc, tracked_pids)
+    if auto_terminate and get_tracked_processes(proc, tracked_pids, discovery_context):
+        termination = terminate_process_tree(proc, tracked_pids, discovery_context)
         exit_code = termination.exit_code
         shutdown_time_sec = termination.shutdown_time_sec
         force_killed_processes = termination.force_killed_processes
